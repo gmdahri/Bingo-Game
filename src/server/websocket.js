@@ -3,6 +3,7 @@ const { WebSocketServer } = require('ws');
 // In-memory storage for rooms and players
 const rooms = new Map();
 const players = new Map(); // playerId -> { ws, roomCode, playerData }
+const turnTimers = new Map(); // roomCode -> timerId
 
 console.log('Starting WebSocket server on port 8080...');
 
@@ -66,6 +67,9 @@ const handleMessage = (ws, message) => {
     case 'call_number':
       handleCallNumber(message);
       break;
+    case 'skip_turn':
+      handleSkipTurn(message);
+      break;
     case 'claim_bingo':
       handleClaimBingo(message);
       break;
@@ -85,7 +89,7 @@ const handleMessage = (ws, message) => {
 };
 
 const handleCreateRoom = (ws, message) => {
-  const { roomCode, playerName, playerId, matrixSize, bingoCard } = message;
+  const { roomCode, playerName, playerId, matrixSize, bingoCard, winningCriteria } = message;
   
   console.log(`Creating room ${roomCode} for player ${playerName}`);
   
@@ -98,11 +102,17 @@ const handleCreateRoom = (ws, message) => {
     return;
   }
   
-  // Create new room
+  // Create new room with settings
+  const roomSettings = {
+    matrixSize,
+    winningCriteria,
+    turnTimeLimit: 10 // 10 seconds per turn
+  };
+  
   rooms.set(roomCode, {
     players: [],
     host: playerId,
-    matrixSize,
+    settings: roomSettings, // Store room settings
     gameStarted: false,
     calledNumbers: [],
     availableNumbers: Array.from({ length: matrixSize * matrixSize }, (_, i) => i + 1),
@@ -138,16 +148,23 @@ const handleCreateRoom = (ws, message) => {
     players: room.players,
     gameStarted: room.gameStarted,
     currentCaller: room.currentCaller,
+    calledNumbers: room.calledNumbers || [],
+    availableNumbers: room.availableNumbers || [],
     bingoCard,
+    roomSettings: room.settings,
     roomInfo: {
-      matrixSize: room.matrixSize,
-      createdAt: room.createdAt
-    }
+      matrixSize: room.settings.matrixSize,
+      createdAt: room.createdAt,
+      winningCriteria: room.settings.winningCriteria
+    },
+    // Add player identification for the client
+    playerId: playerId,
+    isHost: true
   }));
 };
 
 const handleJoinRoom = (ws, message) => {
-  const { roomCode, playerName, playerId, bingoCard } = message;
+  const { roomCode, playerName, playerId } = message;
   
   console.log(`Player ${playerName} trying to join room ${roomCode}`);
   
@@ -171,6 +188,26 @@ const handleJoinRoom = (ws, message) => {
     return;
   }
 
+  // Generate BINGO card based on room's matrix size
+  const generateBingoCard = (size) => {
+    const maxNumber = size * size;
+    const numbers = [];
+    const usedNumbers = new Set();
+    
+    for (let i = 0; i < maxNumber; i++) {
+      let num;
+      do {
+        num = Math.floor(Math.random() * maxNumber) + 1;
+      } while (usedNumbers.has(num));
+      usedNumbers.add(num);
+      numbers.push(num);
+    }
+    
+    return numbers;
+  };
+
+  const bingoCard = generateBingoCard(room.settings.matrixSize);
+
   // Add player to room
   const playerData = {
     ws,
@@ -190,7 +227,7 @@ const handleJoinRoom = (ws, message) => {
 
   console.log(`Player ${playerName} joined room ${roomCode}. Total players: ${room.players.length}`);
 
-  // Notify new player
+  // Notify new player with room settings
   ws.send(JSON.stringify({
     type: 'room_joined',
     players: room.players,
@@ -199,8 +236,9 @@ const handleJoinRoom = (ws, message) => {
     calledNumbers: room.calledNumbers,
     availableNumbers: room.availableNumbers,
     bingoCard,
+    roomSettings: room.settings, // Include room settings for joiners
     roomInfo: {
-      matrixSize: room.matrixSize,
+      matrixSize: room.settings.matrixSize,
       createdAt: room.createdAt
     }
   }));
@@ -211,6 +249,58 @@ const handleJoinRoom = (ws, message) => {
     players: room.players,
     newPlayer: playerData.playerData
   }, playerId);
+};
+
+const startTurnTimer = (roomCode) => {
+  // Clear existing timer if any
+  if (turnTimers.has(roomCode)) {
+    clearTimeout(turnTimers.get(roomCode));
+  }
+  
+  const room = rooms.get(roomCode);
+  if (!room || !room.gameStarted || room.winner) return;
+  
+  console.log(`Starting 10-second timer for room ${roomCode}`);
+  
+  const timerId = setTimeout(() => {
+    console.log(`Timer expired for room ${roomCode}, auto-skipping turn`);
+    autoSkipTurn(roomCode);
+  }, 10000); // 10 seconds
+  
+  turnTimers.set(roomCode, timerId);
+};
+
+const clearTurnTimer = (roomCode) => {
+  if (turnTimers.has(roomCode)) {
+    clearTimeout(turnTimers.get(roomCode));
+    turnTimers.delete(roomCode);
+  }
+};
+
+const autoSkipTurn = (roomCode) => {
+  const room = rooms.get(roomCode);
+  if (!room || !room.gameStarted || room.winner) return;
+  
+  // Find next caller (rotate through players)
+  const currentIndex = room.players.findIndex(p => p.id === room.currentCaller);
+  const nextIndex = (currentIndex + 1) % room.players.length;
+  const nextCaller = room.players[nextIndex]?.id;
+  
+  console.log(`Auto-skipping turn in room ${roomCode}. Next caller: ${nextCaller}`);
+  
+  room.currentCaller = nextCaller;
+  
+  broadcastToRoom(roomCode, {
+    type: 'turn_skipped',
+    nextCaller,
+    reason: 'timeout',
+    skippedAt: new Date()
+  });
+  
+  // Start timer for next player
+  if (nextCaller && room.gameStarted && !room.winner) {
+    startTurnTimer(roomCode);
+  }
 };
 
 const handleStartGame = (message) => {
@@ -230,12 +320,20 @@ const handleStartGame = (message) => {
   room.currentCaller = currentCaller;
   room.winner = null;
 
+  // Clear any existing timers and start fresh
+  clearTurnTimer(roomCode);
+
   broadcastToRoom(roomCode, {
     type: 'game_started',
     currentCaller,
     availableNumbers,
     gameStartedAt: new Date()
   });
+  
+  // Start timer for first caller
+  if (currentCaller) {
+    startTurnTimer(roomCode);
+  }
 };
 
 const handleCallNumber = (message) => {
@@ -253,6 +351,9 @@ const handleCallNumber = (message) => {
   room.availableNumbers = availableNumbers;
   room.currentCaller = nextCaller;
 
+  // Clear current timer and start new one for next player
+  clearTurnTimer(roomCode);
+
   broadcastToRoom(roomCode, {
     type: 'number_called',
     number,
@@ -261,10 +362,44 @@ const handleCallNumber = (message) => {
     nextCaller,
     calledAt: new Date()
   });
+  
+  // Start timer for next caller if game is still active
+  if (nextCaller && room.gameStarted && !room.winner) {
+    startTurnTimer(roomCode);
+  }
+};
+
+const handleSkipTurn = (message) => {
+  const { roomCode, nextCaller } = message;
+  const room = rooms.get(roomCode);
+  
+  if (!room) {
+    console.log(`Cannot skip turn: Room ${roomCode} not found`);
+    return;
+  }
+
+  console.log(`Turn skipped in room ${roomCode}. Next caller: ${nextCaller}`);
+
+  room.currentCaller = nextCaller;
+
+  // Clear current timer and start new one for next player
+  clearTurnTimer(roomCode);
+
+  broadcastToRoom(roomCode, {
+    type: 'turn_skipped',
+    nextCaller,
+    reason: 'manual',
+    skippedAt: new Date()
+  });
+  
+  // Start timer for next caller if game is still active
+  if (nextCaller && room.gameStarted && !room.winner) {
+    startTurnTimer(roomCode);
+  }
 };
 
 const handleClaimBingo = (message) => {
-  const { roomCode, winner, playerId } = message;
+  const { roomCode, winner, playerId, winningPattern, completedLines } = message;
   const room = rooms.get(roomCode);
   
   if (!room) {
@@ -272,133 +407,149 @@ const handleClaimBingo = (message) => {
     return;
   }
 
-  console.log(`BINGO claimed by ${winner} in room ${roomCode}!`);
+  console.log(`BINGO claimed in room ${roomCode} by ${winner}`);
 
+  // Stop the game immediately
   room.winner = winner;
   room.gameStarted = false;
+  
+  // Clear turn timer since game is over
+  clearTurnTimer(roomCode);
 
   broadcastToRoom(roomCode, {
     type: 'game_won',
     winner,
+    playerId,
+    winningPattern,
+    completedLines,
     wonAt: new Date()
   });
 };
 
 const handleLeaveRoom = (message) => {
-  const { playerId } = message;
-  console.log(`Player ${playerId} leaving room`);
-  handlePlayerDisconnect(playerId);
-};
-
-const handlePlayerDisconnect = (playerId) => {
-  const playerData = players.get(playerId);
-  if (!playerData) return;
-
-  const { roomCode } = playerData;
-  const room = rooms.get(roomCode);
+  const { roomCode, playerId } = message;
   
-  if (room) {
-    const leavingPlayer = room.players.find(p => p.id === playerId);
-    console.log(`Player ${leavingPlayer?.name || playerId} disconnected from room ${roomCode}`);
-    
-    // Remove player from room
-    room.players = room.players.filter(p => p.id !== playerId);
-    
-    // If host left, assign new host
-    let newHost = null;
-    if (room.host === playerId && room.players.length > 0) {
-      room.host = room.players[0].id;
-      room.players[0].isHost = true;
-      newHost = room.players[0].id;
-      console.log(`New host assigned: ${room.players[0].name}`);
-    }
+  console.log(`Player ${playerId} leaving room ${roomCode}`);
+  
+  const playerData = players.get(playerId);
+  if (!playerData) {
+    console.log(`Player ${playerId} not found`);
+    return;
+  }
 
-    // If room is empty, delete it
-    if (room.players.length === 0) {
-      console.log(`Room ${roomCode} is empty, deleting...`);
-      rooms.delete(roomCode);
-    } else {
-      // Notify remaining players
-      broadcastToRoom(roomCode, {
-        type: 'player_left',
-        players: room.players,
-        newHost,
-        leftPlayer: leavingPlayer
-      });
+  const room = rooms.get(roomCode);
+  if (!room) {
+    console.log(`Room ${roomCode} not found`);
+    return;
+  }
+
+  // Remove player from room
+  room.players = room.players.filter(p => p.id !== playerId);
+  players.delete(playerId);
+
+  // If this was the host, assign new host
+  let newHost = null;
+  if (room.host === playerId && room.players.length > 0) {
+    newHost = room.players[0].id;
+    room.host = newHost;
+    room.players[0].isHost = true;
+    
+    // Update the player data in the players map
+    const newHostPlayerData = players.get(newHost);
+    if (newHostPlayerData) {
+      newHostPlayerData.playerData.isHost = true;
     }
   }
 
-  players.delete(playerId);
+  console.log(`Player left room ${roomCode}. Remaining players: ${room.players.length}`);
+
+  // If no players left, clean up room and timer
+  if (room.players.length === 0) {
+    clearTurnTimer(roomCode);
+    rooms.delete(roomCode);
+    console.log(`Room ${roomCode} deleted (no players remaining)`);
+    return;
+  }
+
+  // If current caller left, advance to next player
+  if (room.currentCaller === playerId && room.gameStarted && !room.winner) {
+    const nextIndex = 0; // Start with first remaining player
+    const nextCaller = room.players[nextIndex]?.id;
+    room.currentCaller = nextCaller;
+    
+    clearTurnTimer(roomCode);
+    if (nextCaller) {
+      startTurnTimer(roomCode);
+    }
+    
+    broadcastToRoom(roomCode, {
+      type: 'caller_changed',
+      nextCaller,
+      reason: 'player_left'
+    });
+  }
+
+  // Notify remaining players
+  broadcastToRoom(roomCode, {
+    type: 'player_left',
+    players: room.players,
+    leftPlayer: playerData.playerData,
+    newHost
+  });
+};
+
+const handlePlayerDisconnect = (playerId) => {
+  console.log(`Handling disconnect for player ${playerId}`);
+  
+  const playerData = players.get(playerId);
+  if (!playerData) {
+    console.log(`Player ${playerId} not found in players map`);
+    return;
+  }
+
+  const roomCode = playerData.roomCode;
+  handleLeaveRoom({ roomCode, playerId });
 };
 
 const broadcastToRoom = (roomCode, message, excludePlayerId = null) => {
   const room = rooms.get(roomCode);
-  if (!room) return;
+  if (!room) {
+    console.log(`Cannot broadcast to room ${roomCode}: room not found`);
+    return;
+  }
 
-  let successCount = 0;
-  let failCount = 0;
+  console.log(`Broadcasting to room ${roomCode}:`, message.type);
 
   room.players.forEach(player => {
-    if (player.id === excludePlayerId) return;
+    if (excludePlayerId && player.id === excludePlayerId) return;
     
-    const playerData = players.get(player.id);
-    if (playerData && playerData.ws && playerData.ws.readyState === 1) {
+    const playerConnection = players.get(player.id);
+    if (playerConnection && playerConnection.ws.readyState === playerConnection.ws.OPEN) {
       try {
-        playerData.ws.send(JSON.stringify(message));
-        successCount++;
+        playerConnection.ws.send(JSON.stringify(message));
       } catch (error) {
-        console.error(`Error sending message to player ${player.name}:`, error);
-        failCount++;
+        console.error(`Error sending message to player ${player.id}:`, error);
       }
-    } else {
-      failCount++;
     }
   });
-
-  if (message.type !== 'ping') {
-    console.log(`Broadcasted ${message.type} to room ${roomCode}: ${successCount} success, ${failCount} failed`);
-  }
 };
 
-// Cleanup inactive connections
-const cleanupInactiveConnections = () => {
-  console.log('Cleaning up inactive connections...');
-  let cleaned = 0;
-  
-  for (const [playerId, playerData] of players.entries()) {
-    if (!playerData.ws || playerData.ws.readyState !== 1) {
-      handlePlayerDisconnect(playerId);
-      cleaned++;
-    }
-  }
-  
-  if (cleaned > 0) {
-    console.log(`Cleaned up ${cleaned} inactive connections`);
-  }
-};
-
-// Run cleanup every 30 seconds
-setInterval(cleanupInactiveConnections, 30000);
-
-// Graceful shutdown
+// Cleanup function for when server shuts down
 process.on('SIGINT', () => {
-  console.log('\nShutting down WebSocket server...');
-  wss.close((err) => {
-    if (err) {
-      console.error('Error closing WebSocket server:', err);
-    } else {
-      console.log('WebSocket server closed successfully');
-    }
-    process.exit(0);
+  console.log('Shutting down server...');
+  
+  // Clear all turn timers
+  for (const [roomCode, timerId] of turnTimers.entries()) {
+    clearTimeout(timerId);
+  }
+  turnTimers.clear();
+  
+  // Close all WebSocket connections
+  wss.clients.forEach((ws) => {
+    ws.close(1000, 'Server shutting down');
   });
+  
+  process.exit(0);
 });
 
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  wss.close();
-});
-
-// Log server stats every minute
-setInterval(() => {
-  console.log(`Server stats - Rooms: ${rooms.size}, Active players: ${players.size}`);
-}, 60000);
+console.log('BINGO WebSocket server is running with turn timers enabled!');

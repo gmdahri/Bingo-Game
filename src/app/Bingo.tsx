@@ -1,6 +1,7 @@
+
 'use client'
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Users, Settings, Play, RotateCcw, Trophy, Copy, Check, Volume2, VolumeX } from 'lucide-react';
+import { Users, Settings, Play, RotateCcw, Trophy, Copy, Check, Volume2, VolumeX, Clock } from 'lucide-react';
 
 const BINGOGame = () => {
   // WebSocket connection
@@ -27,7 +28,13 @@ const BINGOGame = () => {
   const [currentCaller, setCurrentCaller] = useState(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [lastCaller, setLastCaller] = useState(null);
-  const [winningCriteria, setWinningCriteria] = useState('standard'); // 'standard', 'multiple'
+  const [winningCriteria, setWinningCriteria] = useState('multiple'); // 'standard', 'multiple'
+  
+  // Timer state
+  const [timeRemaining, setTimeRemaining] = useState(0);
+  const [isTimerActive, setIsTimerActive] = useState(false);
+  const timerRef = useRef(null);
+  const [roomSettings, setRoomSettings] = useState(null);
 
   // Generate room code
   const generateRoomCode = () => {
@@ -39,7 +46,54 @@ const BINGOGame = () => {
     return Math.random().toString(36).substring(2, 15);
   };
 
-  // Sound effects - moved up before other functions use it
+  // Timer functions
+  const startTimer = useCallback(() => {
+    setTimeRemaining(10);
+    setIsTimerActive(true);
+    
+    timerRef.current = setInterval(() => {
+      setTimeRemaining((prev) => {
+        if (prev <= 1) {
+          setIsTimerActive(false);
+          // Auto-skip turn if time runs out
+          if (currentCaller === playerId) {
+            skipTurn();
+          }
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, [currentCaller, playerId]);
+
+  const stopTimer = useCallback(() => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    setIsTimerActive(false);
+    setTimeRemaining(0);
+  }, []);
+
+  const skipTurn = useCallback(() => {
+    if (currentCaller !== playerId) return;
+    
+    // Find next caller (rotate through players)
+    const currentIndex = players.findIndex(p => p.id === currentCaller);
+    const nextIndex = (currentIndex + 1) % players.length;
+    const nextCaller = players[nextIndex]?.id;
+    
+    setCurrentCaller(nextCaller);
+    stopTimer();
+    
+    sendMessage({
+      type: 'skip_turn',
+      roomCode,
+      nextCaller
+    });
+  }, [currentCaller, playerId, players, roomCode]);
+
+  // Sound effects
   const playSound = useCallback((type) => {
     if (!soundEnabled) return;
     
@@ -93,7 +147,7 @@ const BINGOGame = () => {
           break;
           
         case 'bingo':
-          // Victory fanfare - much more exciting!
+          // Victory fanfare
           const bingoMelody = [
             { freq: 523, time: 0,    duration: 0.2 }, // C
             { freq: 659, time: 0.2,  duration: 0.2 }, // E
@@ -194,9 +248,10 @@ const BINGOGame = () => {
     return numbers;
   }, []);
 
-  // Handle WebSocket messages
+  // Handle WebSocket messages - FIXED VERSION
   const handleWebSocketMessage = useCallback((data) => {
     console.log('Processing message:', data.type);
+    console.log('Message data:', data);
     
     switch (data.type) {
       case 'connected':
@@ -205,15 +260,38 @@ const BINGOGame = () => {
         
       case 'room_joined':
         console.log('Successfully joined room, players:', data.players?.length);
+        console.log('BINGO card received:', data.bingoCard);
+        
+        // Set ALL state from server response
         setPlayers(data.players || []);
         setGameStarted(data.gameStarted || false);
         setCurrentCaller(data.currentCaller || null);
-        if (data.calledNumbers) {
-          setCalledNumbers(data.calledNumbers);
+        setCalledNumbers(data.calledNumbers || []);
+        setAvailableNumbers(data.availableNumbers || []);
+        
+        // CRITICAL FIX: Set BINGO card from server response
+        if (data.bingoCard && Array.isArray(data.bingoCard) && data.bingoCard.length > 0) {
+          console.log('Setting BINGO card:', data.bingoCard);
+          setBingoCard(data.bingoCard);
+        } else {
+          console.error('Invalid or missing BINGO card:', data.bingoCard);
         }
-        if (data.availableNumbers) {
-          setAvailableNumbers(data.availableNumbers);
+        
+        // Set room settings from server (for joiners)
+        if (data.roomSettings) {
+          console.log('Setting room settings:', data.roomSettings);
+          setRoomSettings(data.roomSettings);
+          setMatrixSize(data.roomSettings.matrixSize);
+          setWinningCriteria(data.roomSettings.winningCriteria);
         }
+        
+        // Set host status from server response
+        if (data.hasOwnProperty('isHost')) {
+          setIsHost(data.isHost);
+        }
+        
+        // Ensure we're in the room state
+        setGameState('room');
         playSound('join-room');
         break;
         
@@ -249,9 +327,16 @@ const BINGOGame = () => {
         playSound('number-called');
         break;
         
+      case 'turn_skipped':
+        console.log('Turn skipped, next caller:', data.nextCaller);
+        setCurrentCaller(data.nextCaller);
+        break;
+        
       case 'game_won':
         console.log('Game won by:', data.winner);
         setWinner(data.winner);
+        setGameStarted(false);
+        stopTimer();
         break;
         
       case 'error':
@@ -270,7 +355,7 @@ const BINGOGame = () => {
       default:
         console.log('Unknown message type:', data.type);
     }
-  }, [playerId]);
+  }, [playerId, playSound, stopTimer]);
 
   const getWebSocketURL = () => {
     // Check if we're in development or production
@@ -286,7 +371,7 @@ const BINGOGame = () => {
     }
   };
 
-  // WebSocket connection setup - simplified
+  // WebSocket connection setup
   const connectWebSocket = useCallback(() => {
     // Prevent multiple connection attempts
     if (isConnecting.current || (ws.current && ws.current.readyState === WebSocket.OPEN)) {
@@ -367,14 +452,17 @@ const BINGOGame = () => {
     }
   }, []);
 
-  // Effect to play sound when it becomes user's turn
+  // Effect to play sound and start timer when it becomes user's turn
   useEffect(() => {
-    if (currentCaller && currentCaller === playerId && lastCaller !== currentCaller) {
+    if (currentCaller && currentCaller === playerId && lastCaller !== currentCaller && gameStarted && !winner) {
       console.log('🎯 It\'s your turn to call!');
       playSound('your-turn');
+      startTimer();
+    } else if (currentCaller !== playerId) {
+      stopTimer();
     }
     setLastCaller(currentCaller);
-  }, [currentCaller, playerId, lastCaller, playSound]);
+  }, [currentCaller, playerId, lastCaller, playSound, gameStarted, winner, startTimer, stopTimer]);
 
   // Initialize WebSocket connection once
   useEffect(() => {
@@ -386,6 +474,10 @@ const BINGOGame = () => {
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current);
         reconnectTimer.current = null;
+      }
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
       }
       if (ws.current) {
         ws.current.onclose = null; // Prevent reconnection
@@ -414,11 +506,12 @@ const BINGOGame = () => {
     const card = generateBingoCard(matrixSize);
     
     console.log('🏠 Creating room:', { newRoomCode, newPlayerId, playerName, matrixSize });
+    console.log('🏠 Generated card:', card);
     
     setRoomCode(newRoomCode);
     setPlayerId(newPlayerId);
     setIsHost(true);
-    setBingoCard(card);
+    setBingoCard(card); // Set immediately for host
     
     const success = sendMessage({
       type: 'create_room',
@@ -431,7 +524,8 @@ const BINGOGame = () => {
     });
     
     if (success) {
-      setGameState('room');
+      // Don't change state here, wait for server response
+      console.log('🏠 Room creation request sent, waiting for server response...');
     }
   };
 
@@ -451,23 +545,21 @@ const BINGOGame = () => {
     playSound('click');
     
     const newPlayerId = generatePlayerId();
-    const card = generateBingoCard(matrixSize);
     
     console.log('🚪 Joining room:', { roomCode, newPlayerId, playerName });
     
     setPlayerId(newPlayerId);
-    setBingoCard(card);
     
     const success = sendMessage({
       type: 'join_room',
       roomCode: roomCode.toUpperCase(),
       playerName,
-      playerId: newPlayerId,
-      bingoCard: card
+      playerId: newPlayerId
     });
     
     if (success) {
-      setGameState('room');
+      // Don't change state here, wait for server response
+      console.log('🚪 Room join request sent, waiting for server response...');
     }
   };
 
@@ -497,9 +589,10 @@ const BINGOGame = () => {
 
   // Call number
   const callNumber = (number) => {
-    if (currentCaller !== playerId || calledNumbers.includes(number)) return;
+    if (currentCaller !== playerId || calledNumbers.includes(number) || !isTimerActive) return;
     
     playSound('click');
+    stopTimer();
     
     const newCalledNumbers = [...calledNumbers, number];
     const newAvailableNumbers = availableNumbers.filter(n => n !== number);
@@ -541,13 +634,11 @@ const BINGOGame = () => {
     setTimeout(() => checkBingo(newMarkedNumbers), 100);
   };
 
-
-  // Check for BINGO - improved logic with configurable winning criteria
+  // Check for BINGO - improved logic
   const checkBingo = useCallback((marked) => {
     const size = matrixSize;
     const card = bingoCard;
     let completedLines = [];
-    let winningPatterns = [];
     
     console.log('🔍 Checking BINGO for card:', card);
     console.log('🔍 Marked numbers:', Array.from(marked));
@@ -570,7 +661,6 @@ const BINGOGame = () => {
       
       if (rowComplete) {
         completedLines.push(`Row ${row + 1}`);
-        winningPatterns.push({ type: 'row', index: row, numbers: rowNumbers });
       }
     }
     
@@ -591,7 +681,6 @@ const BINGOGame = () => {
       
       if (colComplete) {
         completedLines.push(`Column ${col + 1}`);
-        winningPatterns.push({ type: 'column', index: col, numbers: colNumbers });
       }
     }
     
@@ -611,7 +700,6 @@ const BINGOGame = () => {
     
     if (diagonal1Complete) {
       completedLines.push('Diagonal (\\)');
-      winningPatterns.push({ type: 'diagonal1', numbers: diagonal1Numbers });
     }
     
     // Check diagonal (top-right to bottom-left)
@@ -630,7 +718,6 @@ const BINGOGame = () => {
     
     if (diagonal2Complete) {
       completedLines.push('Diagonal (/)');
-      winningPatterns.push({ type: 'diagonal2', numbers: diagonal2Numbers });
     }
     
     // Determine if player wins based on completed lines
@@ -638,11 +725,11 @@ const BINGOGame = () => {
     console.log(`🔍 Total completed lines: ${totalCompletedLines}`);
     console.log(`🔍 Completed lines:`, completedLines);
     
-    // WINNING CRITERIA - configurable based on user selection
+    // WINNING CRITERIA
     let requiredLines;
     switch (winningCriteria) {
       case 'multiple':
-        requiredLines = size + 1; // For 5x5: need 6 lines, for 6x6: need 7 lines
+        requiredLines = size; // For 5x5: need 5 lines
         break;
       case 'all-lines':
         requiredLines = (size * 2) + 2; // All rows + all columns + both diagonals
@@ -660,7 +747,12 @@ const BINGOGame = () => {
       
       console.log(`🎉 BINGO DETECTED! ${winMessage}`);
       playSound('bingo');
+      
+      // Stop the game immediately
       setWinner(`${playerName} (${winMessage})`);
+      setGameStarted(false);
+      stopTimer();
+      
       sendMessage({
         type: 'claim_bingo',
         roomCode,
@@ -672,7 +764,7 @@ const BINGOGame = () => {
     } else {
       console.log(`❌ Need ${requiredLines} completed lines to win, only have ${totalCompletedLines}`);
     }
-  }, [matrixSize, bingoCard, playerName, roomCode, playerId, sendMessage, playSound, winningCriteria]);
+  }, [matrixSize, bingoCard, playerName, roomCode, playerId, sendMessage, playSound, winningCriteria, stopTimer]);
 
   // Copy room code
   const copyRoomCode = async () => {
@@ -688,6 +780,8 @@ const BINGOGame = () => {
   // Reset game
   const resetGame = () => {
     console.log('🔄 Resetting game...');
+    
+    stopTimer();
     
     if (playerId && roomCode) {
       sendMessage({
@@ -712,6 +806,7 @@ const BINGOGame = () => {
     setMatrixSize(5);
     setCurrentCaller(null);
     setWinningCriteria('standard');
+    setRoomSettings(null);
   };
 
   // Get current caller name
@@ -771,7 +866,7 @@ const BINGOGame = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Matrix Size</label>
+              <label className="block text-sm font-medium text-gray-700 mb-2">Matrix Size (Host Only)</label>
               <select
                 value={matrixSize}
                 onChange={(e) => setMatrixSize(parseInt(e.target.value))}
@@ -782,23 +877,24 @@ const BINGOGame = () => {
                 <option value={5}>5x5 (Numbers 1-25)</option>
                 <option value={6}>6x6 (Numbers 1-36)</option>
               </select>
+              <p className="text-xs text-gray-500 mt-1">Only hosts can set the matrix size</p>
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Winning Criteria</label>
+              <label className="block text-sm font-medium text-gray-700 mb-2">Winning Criteria (Host Only)</label>
               <select
                 value={winningCriteria}
                 onChange={(e) => setWinningCriteria(e.target.value)}
                 className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               >
+                <option value="multiple">Challenge: {matrixSize} Lines (Hard Mode)</option>
                 <option value="standard">Standard: 1 Line (Traditional BINGO)</option>
-                <option value="multiple">Challenge: {matrixSize } Lines (Hard Mode)</option>
-                <option value="all-lines">Extreme: All {(matrixSize * 2) + 2} Lines (Expert Mode)</option>
+                <option value="all-lines">Extreme: All Lines (Expert Mode)</option>
               </select>
               <p className="text-xs text-gray-500 mt-1">
                 {winningCriteria === 'standard' && 'Win by completing 1 row, column, or diagonal'}
                 {winningCriteria === 'multiple' && `Win by completing ${matrixSize} different lines`}
-                {winningCriteria === 'all-lines' && `Win by completing all ${(matrixSize * 2) + 2} possible lines`}
+                {winningCriteria === 'all-lines' && 'Win by completing all possible lines'}
               </p>
             </div>
 
@@ -829,6 +925,7 @@ const BINGOGame = () => {
                 className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 placeholder="Enter room code"
               />
+              <p className="text-xs text-gray-500 mt-1">Game settings will be determined by the host</p>
             </div>
 
             <button
@@ -872,8 +969,8 @@ const BINGOGame = () => {
                 <div className="text-sm text-gray-600">
                   Win: {
                     winningCriteria === 'standard' ? '1 line' :
-                    winningCriteria === 'multiple' ? `${matrixSize + 1} lines` :
-                    `All ${(matrixSize * 2) + 2} lines`
+                    winningCriteria === 'multiple' ? `${matrixSize} lines` :
+                    'All lines'
                   }
                 </div>
                 <div className={`text-xs font-medium ${
@@ -923,6 +1020,11 @@ const BINGOGame = () => {
               {gameStarted && currentCaller && (
                 <span className="ml-2 text-blue-600">
                   • Current Caller: {getCurrentCallerName()}
+                  {isTimerActive && (
+                    <span className="ml-1 text-orange-600">
+                      ({timeRemaining}s)
+                    </span>
+                  )}
                 </span>
               )}
             </h3>
@@ -939,7 +1041,12 @@ const BINGOGame = () => {
                   <div className="w-2 h-2 rounded-full bg-green-500"></div>
                   {player.name} 
                   {player.isHost && ' (Host)'}
-                  {currentCaller === player.id && ' 🎯'}
+                  {currentCaller === player.id && isTimerActive && (
+                    <span className="ml-1 flex items-center gap-1">
+                      <Clock size={12} className="text-orange-600" />
+                      <span className="text-orange-600 font-bold">{timeRemaining}s</span>
+                    </span>
+                  )}
                 </div>
               ))}
             </div>
@@ -962,7 +1069,7 @@ const BINGOGame = () => {
           </div>
         )}
 
-        {/* Current Turn Indicator */}
+        {/* Current Turn Indicator with Timer */}
         {gameStarted && !winner && currentCaller && (
           <div className={`rounded-xl p-4 mb-6 text-center ${
             currentCaller === playerId 
@@ -973,10 +1080,28 @@ const BINGOGame = () => {
               currentCaller === playerId ? 'text-orange-800' : 'text-blue-800'
             }`}>
               {currentCaller === playerId 
-                ? '🎯 Your turn to call a number!' 
+                ? isTimerActive 
+                  ? `Your turn! Call a number within ${timeRemaining} seconds` 
+                  : 'Your turn to call a number!'
                 : `Waiting for ${getCurrentCallerName()} to call a number...`
               }
             </p>
+            {currentCaller === playerId && isTimerActive && (
+              <div className="mt-2">
+                <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div 
+                    className="bg-orange-500 h-2 rounded-full transition-all duration-1000"
+                    style={{ width: `${(timeRemaining / 10) * 100}%` }}
+                  ></div>
+                </div>
+                <button
+                  onClick={skipTurn}
+                  className="mt-2 px-3 py-1 bg-gray-500 text-white rounded text-sm hover:bg-gray-600"
+                >
+                  Skip Turn
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -1016,19 +1141,6 @@ const BINGOGame = () => {
                 <strong>Click on called numbers (yellow) to mark them on your card!</strong><br/>
                 Yellow = Called but not marked | Green = Marked by you
               </p>
-              {process.env.NODE_ENV === 'development' && (
-                <div className="mt-4 pt-4 border-t border-gray-200">
-                  <button
-                    onClick={() => {
-                      console.log('🔧 Debug: Force checking BINGO with current marked numbers');
-                      checkBingo(markedNumbers);
-                    }}
-                    className="w-full bg-yellow-500 text-white px-3 py-1 rounded text-sm hover:bg-yellow-600 transition-colors"
-                  >
-                    🔧 Debug: Check BINGO Now
-                  </button>
-                </div>
-              )}
             </div>
           </div>
 
@@ -1069,10 +1181,11 @@ const BINGOGame = () => {
             </div>
 
             {/* Call Number Controls */}
-            {gameStarted && currentCaller === playerId && !winner && (
+            {gameStarted && currentCaller === playerId && !winner && isTimerActive && (
               <div className="bg-white rounded-xl shadow-md p-6">
-                <h3 className="text-lg font-semibold mb-4">
-                  🎯 Call a Number
+                <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                  <Clock size={20} className="text-orange-600" />
+                  Call a Number ({timeRemaining}s)
                 </h3>
                 <div className="grid grid-cols-5 gap-2">
                   {availableNumbers.map((number) => (
@@ -1086,7 +1199,7 @@ const BINGOGame = () => {
                   ))}
                 </div>
                 <p className="text-xs text-gray-500 text-center mt-2">
-                  Click a number to call it
+                  Click a number to call it - You have {timeRemaining} seconds!
                 </p>
               </div>
             )}
@@ -1116,8 +1229,8 @@ const BINGOGame = () => {
                   <span className="font-medium text-purple-600">
                     {
                       winningCriteria === 'standard' ? '1 Line' :
-                      winningCriteria === 'multiple' ? `${matrixSize + 1} Lines` :
-                      `All ${(matrixSize * 2) + 2} Lines`
+                      winningCriteria === 'multiple' ? `${matrixSize} Lines` :
+                      'All Lines'
                     }
                   </span>
                 </div>
@@ -1138,6 +1251,9 @@ const BINGOGame = () => {
                     <span>Current Caller:</span>
                     <span className="font-medium text-orange-600">
                       {currentCaller === playerId ? 'You' : getCurrentCallerName()}
+                      {isTimerActive && currentCaller === playerId && (
+                        <span className="ml-1">({timeRemaining}s)</span>
+                      )}
                     </span>
                   </div>
                 )}
